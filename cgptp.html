@@ -1,19 +1,19 @@
 <!DOCTYPE html>
 <html>
-<body style="margin:0;">
+<head>
+  <meta charset="UTF-8" />
+  <title>WebXR Gun + Screw-On Suppressor Prototype</title>
+</head>
+<body style="margin:0; overflow:hidden;">
 <script type="module">
 import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 import { VRButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/VRButton.js';
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x202020);
+scene.background = new THREE.Color(0x1f2330);
 
-const camera = new THREE.PerspectiveCamera(
-  70,
-  window.innerWidth / window.innerHeight,
-  0.1,
-  100
-);
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 1.6, 0.7);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -21,28 +21,355 @@ renderer.xr.enabled = true;
 document.body.appendChild(renderer.domElement);
 document.body.appendChild(VRButton.createButton(renderer));
 
-// Light
-const light = new THREE.HemisphereLight(0xffffff, 0x444444);
-scene.add(light);
+const hemi = new THREE.HemisphereLight(0xffffff, 0x334455, 1.1);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+dir.position.set(2, 4, 1.5);
+scene.add(dir);
 
-// Floor
 const floor = new THREE.Mesh(
-  new THREE.PlaneGeometry(10,10),
-  new THREE.MeshStandardMaterial({ color: 0x555555 })
+  new THREE.PlaneGeometry(14, 14),
+  new THREE.MeshStandardMaterial({ color: 0x454a54, roughness: 0.95, metalness: 0.05 })
 );
 floor.rotation.x = -Math.PI / 2;
 scene.add(floor);
 
-// Cube in front of you
-const cube = new THREE.Mesh(
-  new THREE.BoxGeometry(0.5,0.5,0.5),
-  new THREE.MeshStandardMaterial({ color: 0x00ff00 })
+const table = new THREE.Mesh(
+  new THREE.BoxGeometry(1.2, 0.06, 0.6),
+  new THREE.MeshStandardMaterial({ color: 0x6a5b4b })
 );
-cube.position.set(0,1.5,-2);
-scene.add(cube);
+table.position.set(0, 1.1, -0.7);
+scene.add(table);
+
+const info = document.createElement('div');
+info.style.cssText = 'position:fixed;left:12px;top:10px;color:#fff;font-family:monospace;line-height:1.4;white-space:pre;z-index:100';
+info.textContent = 'Desktop:\nG: grab nearest\nF: shoot\nQ/E: twist while holding suppressor near muzzle\nXR: grab with trigger, screw by twisting controller';
+document.body.appendChild(info);
+
+const interactables = [];
+const bullets = [];
+const targets = [];
+const clock = new THREE.Clock();
+
+const gun = new THREE.Group();
+gun.position.set(-0.2, 1.17, -0.7);
+scene.add(gun);
+
+const gunMat = new THREE.MeshStandardMaterial({ color: 0x2d3239, metalness: 0.55, roughness: 0.45 });
+const gripMat = new THREE.MeshStandardMaterial({ color: 0x161819, roughness: 0.85, metalness: 0.1 });
+
+const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.08, 0.26), gunMat);
+receiver.position.set(0, 0.02, -0.04);
+gun.add(receiver);
+
+const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.013, 0.013, 0.24, 16), gunMat);
+barrel.rotation.x = Math.PI / 2;
+barrel.position.set(0, 0.02, -0.28);
+gun.add(barrel);
+
+const grip = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.13, 0.06), gripMat);
+grip.position.set(0, -0.07, 0.03);
+grip.rotation.x = -0.25;
+gun.add(grip);
+
+const stock = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.1), gunMat);
+stock.position.set(0, 0.01, 0.12);
+gun.add(stock);
+
+const muzzleMarker = new THREE.Object3D();
+muzzleMarker.position.set(0, 0.02, -0.40);
+gun.add(muzzleMarker);
+
+gun.userData = {
+  type: 'gun',
+  heldBy: null,
+  grabbable: true
+};
+interactables.push(gun);
+
+const suppressor = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.018, 0.018, 0.18, 18),
+  new THREE.MeshStandardMaterial({ color: 0x0f1112, metalness: 0.75, roughness: 0.35 })
+);
+suppressor.rotation.x = Math.PI / 2;
+suppressor.position.set(0.2, 1.17, -0.7);
+scene.add(suppressor);
+
+suppressor.userData = {
+  type: 'suppressor',
+  heldBy: null,
+  grabbable: true,
+  attached: false,
+  threadProgress: 0
+};
+interactables.push(suppressor);
+
+for (let i = 0; i < 6; i++) {
+  const target = new THREE.Mesh(
+    new THREE.BoxGeometry(0.14, 0.14, 0.14),
+    new THREE.MeshStandardMaterial({ color: 0x3a93ff })
+  );
+  target.position.set(-0.5 + i * 0.2, 1.5, -2.2 - (i % 2) * 0.2);
+  target.userData.baseY = target.position.y;
+  scene.add(target);
+  targets.push(target);
+}
+
+function getMuzzleWorld(outPos = new THREE.Vector3(), outQuat = new THREE.Quaternion()) {
+  muzzleMarker.getWorldPosition(outPos);
+  muzzleMarker.getWorldQuaternion(outQuat);
+  return { outPos, outQuat };
+}
+
+function tryGrab(controllerLike) {
+  if (controllerLike.userData.grabbing) return;
+
+  const handPos = new THREE.Vector3();
+  controllerLike.getWorldPosition(handPos);
+
+  let nearest = null;
+  let nearestDist = 0.16;
+
+  for (const item of interactables) {
+    if (!item.userData.grabbable || item.userData.heldBy) continue;
+
+    const p = new THREE.Vector3();
+    item.getWorldPosition(p);
+    const d = p.distanceTo(handPos);
+    if (d < nearestDist) {
+      nearest = item;
+      nearestDist = d;
+    }
+  }
+
+  if (!nearest) return;
+
+  if (nearest === suppressor && suppressor.userData.attached) {
+    // While attached, suppressor must be unscrewed in-place.
+    controllerLike.userData.grabbing = suppressor;
+    suppressor.userData.heldBy = controllerLike;
+    controllerLike.userData.prevQuat.copy(controllerLike.quaternion);
+    return;
+  }
+
+  controllerLike.add(nearest);
+  nearest.position.set(0, -0.03, -0.08);
+  nearest.quaternion.identity();
+  nearest.userData.heldBy = controllerLike;
+  controllerLike.userData.grabbing = nearest;
+  controllerLike.userData.prevQuat.copy(controllerLike.quaternion);
+}
+
+function release(controllerLike) {
+  const held = controllerLike.userData.grabbing;
+  if (!held) return;
+
+  controllerLike.userData.grabbing = null;
+  held.userData.heldBy = null;
+
+  if (held === suppressor && suppressor.userData.attached) {
+    return;
+  }
+
+  scene.attach(held);
+}
+
+function createController(index) {
+  const controller = renderer.xr.getController(index);
+  controller.userData = {
+    grabbing: null,
+    prevQuat: new THREE.Quaternion(),
+    shooting: false,
+    cooldown: 0
+  };
+
+  controller.addEventListener('selectstart', () => {
+    tryGrab(controller);
+    controller.userData.shooting = true;
+  });
+
+  controller.addEventListener('selectend', () => {
+    release(controller);
+    controller.userData.shooting = false;
+  });
+
+  scene.add(controller);
+  return controller;
+}
+
+const controllers = [createController(0), createController(1)];
+
+function fireBullet(fromGun) {
+  const bullet = new THREE.Mesh(
+    new THREE.SphereGeometry(0.008, 8, 8),
+    new THREE.MeshStandardMaterial({ color: 0xffcc55, emissive: 0x442200 })
+  );
+
+  const muzzlePos = new THREE.Vector3();
+  const muzzleQuat = new THREE.Quaternion();
+  getMuzzleWorld(muzzlePos, muzzleQuat);
+
+  bullet.position.copy(muzzlePos);
+  const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(muzzleQuat).normalize();
+
+  bullet.userData.velocity = dir.multiplyScalar(7.5);
+  bullet.userData.life = 2.0;
+  scene.add(bullet);
+  bullets.push(bullet);
+
+  fromGun.position.z += 0.01;
+}
+
+const deltaQuat = new THREE.Quaternion();
+const axis = new THREE.Vector3();
+
+function updateScrewInteraction(controllerLike, dt, desktopTwist = 0) {
+  if (controllerLike.userData.grabbing !== suppressor) return;
+
+  const muzzlePos = new THREE.Vector3();
+  const muzzleQuat = new THREE.Quaternion();
+  getMuzzleWorld(muzzlePos, muzzleQuat);
+
+  const forwardAxis = new THREE.Vector3(0, 0, -1).applyQuaternion(muzzleQuat).normalize();
+
+  const supPos = new THREE.Vector3();
+  suppressor.getWorldPosition(supPos);
+  const distToMuzzle = supPos.distanceTo(muzzlePos);
+
+  if (!suppressor.userData.attached && distToMuzzle < 0.09) {
+    scene.attach(suppressor);
+    gun.attach(suppressor);
+    suppressor.position.set(0, 0.02, -0.49 + (1 - suppressor.userData.threadProgress) * 0.04);
+    suppressor.rotation.set(Math.PI / 2, 0, 0);
+  }
+
+  if (distToMuzzle > 0.18 && !suppressor.userData.attached) {
+    controllerLike.userData.prevQuat.copy(controllerLike.quaternion);
+    return;
+  }
+
+  deltaQuat.copy(controllerLike.userData.prevQuat).invert().multiply(controllerLike.quaternion);
+  let angle = 2 * Math.acos(THREE.MathUtils.clamp(deltaQuat.w, -1, 1));
+  if (angle > Math.PI) angle -= 2 * Math.PI;
+
+  const s = Math.sqrt(Math.max(1 - deltaQuat.w * deltaQuat.w, 0));
+  if (s > 0.0001) {
+    axis.set(deltaQuat.x / s, deltaQuat.y / s, deltaQuat.z / s);
+  } else {
+    axis.set(0, 0, 0);
+  }
+
+  const signedTwist = axis.dot(forwardAxis) * angle + desktopTwist;
+
+  suppressor.userData.threadProgress = THREE.MathUtils.clamp(
+    suppressor.userData.threadProgress + signedTwist * 0.55,
+    0,
+    1
+  );
+
+  const zOffset = -0.49 + (1 - suppressor.userData.threadProgress) * 0.04;
+  suppressor.position.set(0, 0.02, zOffset);
+
+  if (suppressor.userData.threadProgress >= 1) {
+    suppressor.userData.attached = true;
+  }
+
+  if (suppressor.userData.attached && suppressor.userData.threadProgress <= 0) {
+    suppressor.userData.attached = false;
+    gun.remove(suppressor);
+    scene.add(suppressor);
+    const outPos = new THREE.Vector3();
+    suppressor.getWorldPosition(outPos);
+    suppressor.position.copy(outPos);
+    suppressor.rotation.x = Math.PI / 2;
+    controllerLike.add(suppressor);
+    suppressor.position.set(0, -0.03, -0.08);
+  }
+
+  controllerLike.userData.prevQuat.copy(controllerLike.quaternion);
+}
+
+// Desktop fallback controls for quick testing without headset.
+const desktop = {
+  proxy: new THREE.Object3D(),
+  grabbing: false,
+  shoot: false,
+  twistDir: 0
+};
+desktop.proxy.position.set(0, 1.45, 0.05);
+desktop.proxy.userData = {
+  grabbing: null,
+  prevQuat: new THREE.Quaternion(),
+  shooting: false,
+  cooldown: 0
+};
+scene.add(desktop.proxy);
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyG') tryGrab(desktop.proxy);
+  if (e.code === 'KeyF') desktop.shoot = true;
+  if (e.code === 'KeyQ') desktop.twistDir = 1;
+  if (e.code === 'KeyE') desktop.twistDir = -1;
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'KeyG') release(desktop.proxy);
+  if (e.code === 'KeyF') desktop.shoot = false;
+  if (e.code === 'KeyQ' || e.code === 'KeyE') desktop.twistDir = 0;
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
 
 renderer.setAnimationLoop(() => {
-  cube.rotation.y += 0.01;
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  for (const controller of [...controllers, desktop.proxy]) {
+    controller.userData.cooldown -= dt;
+
+    const held = controller.userData.grabbing;
+    if (held === gun && (controller.userData.shooting || controller === desktop.proxy && desktop.shoot) && controller.userData.cooldown <= 0) {
+      fireBullet(gun);
+      controller.userData.cooldown = suppressor.userData.attached ? 0.12 : 0.08;
+    }
+
+    if (held === suppressor || (suppressor.userData.attached && suppressor.userData.heldBy === controller)) {
+      const desktopTwist = controller === desktop.proxy ? desktop.twistDir * dt * 2.6 : 0;
+      updateScrewInteraction(controller, dt, desktopTwist);
+    }
+  }
+
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.position.addScaledVector(b.userData.velocity, dt);
+    b.userData.life -= dt;
+
+    let hit = false;
+    for (const t of targets) {
+      if (b.position.distanceTo(t.position) < 0.09) {
+        t.material.color.setHex(0xff5533);
+        t.userData.hitTimer = 0.25;
+        hit = true;
+      }
+    }
+
+    if (hit || b.userData.life <= 0) {
+      scene.remove(b);
+      bullets.splice(i, 1);
+    }
+  }
+
+  const tNow = performance.now() * 0.001;
+  for (const t of targets) {
+    t.position.y = t.userData.baseY + Math.sin(tNow * 1.6 + t.position.x * 4) * 0.05;
+    if (t.userData.hitTimer) {
+      t.userData.hitTimer -= dt;
+      if (t.userData.hitTimer <= 0) t.material.color.setHex(0x3a93ff);
+    }
+  }
+
   renderer.render(scene, camera);
 });
 </script>
